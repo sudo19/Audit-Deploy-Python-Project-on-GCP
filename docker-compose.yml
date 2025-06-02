@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  email-processor:
+    build: .
+    container_name: email-processor-api
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - DEBUG=False
+    volumes:
+      # Mount logs directory for persistent logging
+      - ./logs:/app/logs
+      # Mount attachments directory for email attachments
+      - ./attachments:/app/attachments
+      # Mount config directory if you have configuration files
+      - ./config:/app/config:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - email-processor-network
+
+  # Optional: Add a reverse proxy like nginx
+  nginx:
+    image: nginx:alpine
+    container_name: email-processor-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/ssl:ro  # For SSL certificates
+    depends_on:
+      - email-processor
+    restart: unless-stopped
+    networks:
+      - email-processor-network
+
+networks:
+  email-processor-network:
+    driver: bridge
+
+volumes:
+  logs:
+    driver: local
+  attachments:
+    driver: local
