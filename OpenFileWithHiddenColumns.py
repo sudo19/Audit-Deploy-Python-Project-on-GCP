@@ -1,987 +1,1020 @@
-import os
-import base64
-import re
-import pickle
+import pandas as pd
+from sqlalchemy import create_engine
+import openpyxl
 import time
-import logging
-import schedule
-import signal
-import sys
+import re
+import os
+import glob
+import time
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-import json
-import argparse
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, asdict
-from contextlib import contextmanager
 
-try:
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from google.auth.transport.requests import Request
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-    from bs4 import BeautifulSoup
-except ImportError as e:
-    error_msg = f"Missing required dependencies: {e}\nPlease install required packages: pip install -r requirements.txt"
-    logging.error(error_msg)
-    sys.exit(1)
+def escape_special_chars(value):
+    """Escape special characters for SQL query"""
+    if value is None:
+        return "NULL"
+    return str(value).replace("'", "''")  # Escape single quotes
 
-# Gmail API scope - only reading, no sending
-SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+class SQLQueryRunner:
+    def __init__(self, server, database, username, password, port=1433):
+        self.server = server
+        self.database = database
+        self.username = username
+        self.password = password
+        self.port = port
+        self.engine = None
 
-
-@dataclass
-class EmailAttachment:
-    """Data class for email attachments."""
-    original_name: str
-    saved_path: str
-    size: Optional[int] = None
-
-
-@dataclass
-class SterlingEmail:
-    """Data class for Sterling email information."""
-    id: str
-    subject: str
-    sender: str
-    sender_email: str
-    date: str
-    retrieved_at: str
-    attachments: List[EmailAttachment]
-    email_content_file: str
-    email_json_file: str  # New field for individual email JSON
-    plain_text_preview: Optional[str] = None
-
-
-class ConfigurationError(Exception):
-    """Custom exception for configuration errors."""
-    pass
-
-
-class AuthenticationError(Exception):
-    """Custom exception for authentication errors."""
-    pass
-
-
-class EmailProcessingError(Exception):
-    """Custom exception for email processing errors."""
-    pass
-
-
-class Logger:
-    """Centralized logging configuration."""
-
-    @staticmethod
-    def setup_logger(name: str, log_file: str = "sterling_monitor.log", level: int = logging.INFO) -> logging.Logger:
-        """Set up and return a configured logger."""
-        logger = logging.getLogger(name)
-        logger.setLevel(level)
-
-        # Remove existing handlers to avoid duplicates
-        for handler in logger.handlers[:]:
-            logger.removeHandler(handler)
-
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-        # Console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setFormatter(formatter)
-        logger.addHandler(console_handler)
-
-        # File handler
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-
-        return logger
-
-
-class FileManager:
-    """Handles file operations and directory management."""
-
-    def __init__(self, base_dir: Path):
-        self.base_dir = Path(base_dir)
-        self.attachment_dir = self.base_dir / 'attachments'
-        self.log_dir = self.base_dir / 'logs'
-        self.emails_dir = self.base_dir / 'emails'  # New directory for all emails
-        self._setup_directories()
-
-    def _setup_directories(self) -> None:
-        """Create necessary directories."""
-        for directory in [self.base_dir, self.attachment_dir, self.log_dir, self.emails_dir]:
-            directory.mkdir(exist_ok=True)
-
-    def _get_timestamp_string(self) -> str:
-        """Get current timestamp as string for filenames."""
-        return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    def _sanitize_timestamp_for_filename(self, timestamp_str: str) -> str:
-        """Convert timestamp to filename-safe format."""
-        return timestamp_str.replace(' ', '_').replace(':', '').replace('-', '')
-
-    @property
-    def last_processed_file(self) -> Path:
-        return self.base_dir / 'last_processed_email.txt'
-
-    @property
-    def latest_email_file(self) -> Path:
-        """Get latest email file with timestamp."""
-        timestamp = self._get_timestamp_string()
-        return self.base_dir / f'latest_sterling_email_{timestamp}.json'
-
-    def get_timestamped_email_file(self, email_id: str, retrieved_at: str = None) -> Path:
-        """Get timestamped email file path."""
-        if retrieved_at:
-            # Convert retrieved_at to filename-safe format
-            timestamp = self._sanitize_timestamp_for_filename(retrieved_at)
-        else:
-            timestamp = self._get_timestamp_string()
-        return self.emails_dir / f'sterling_email_{email_id}_{timestamp}.json'
-
-    def get_all_emails_summary_file(self) -> Path:
-        """Get summary file for all emails with timestamp."""
-        timestamp = self._get_timestamp_string()
-        return self.base_dir / f'all_sterling_emails_{timestamp}.json'
-
-    def get_timestamped_content_file(self, email_id: str, retrieved_at: str = None) -> Path:
-        """Get timestamped email content file path."""
-        if retrieved_at:
-            timestamp = self._sanitize_timestamp_for_filename(retrieved_at)
-        else:
-            timestamp = self._get_timestamp_string()
-        return self.base_dir / f'sterling_content_{email_id}_{timestamp}.txt'
-
-    @property
-    def summary_file(self) -> Path:
-        """Legacy summary file - kept for backward compatibility."""
-        return self.base_dir / 'sterling_emails_summary.json'
-
-    def save_json(self, data: Any, file_path: Path) -> None:
-        """Save data to JSON file."""
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, default=str)
-
-    def load_json(self, file_path: Path) -> Optional[Dict]:
-        """Load data from JSON file."""
-        if not file_path.exists():
-            return None
+    def connect_to_sql(self):
+        """Establish SQL Server connection using SQLAlchemy"""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception:
-            return None
-
-    def read_text_file(self, file_path: Path) -> Optional[str]:
-        """Read text from file."""
-        if not file_path.exists():
-            return None
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read().strip()
-        except Exception:
-            return None
-
-    def write_text_file(self, file_path: Path, content: str) -> None:
-        """Write text to file."""
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-    def get_all_processed_emails(self) -> List[Dict]:
-        """Get list of all processed emails from the emails directory."""
-        all_emails = []
-        if not self.emails_dir.exists():
-            return all_emails
-
-        for json_file in self.emails_dir.glob('sterling_email_*.json'):
-            email_data = self.load_json(json_file)
-            if email_data:
-                all_emails.append(email_data)
-
-        # Sort by retrieved_at timestamp (newest first)
-        all_emails.sort(key=lambda x: x.get('retrieved_at', ''), reverse=True)
-        return all_emails
-
-
-class HTMLProcessor:
-    """Handles HTML to text conversion."""
-
-    @staticmethod
-    def html_to_plain_text(html_content: str) -> str:
-        """Convert HTML content to plain text."""
-        if not html_content:
-            return ""
-
-        try:
-            soup = BeautifulSoup(html_content, 'html.parser')
-
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.extract()
-
-            # Get text
-            text = soup.get_text(separator='\n')
-
-            # Clean up whitespace
-            lines = (line.strip() for line in text.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            text = '\n'.join(chunk for chunk in chunks if chunk)
-
-            return text
-        except Exception:
-            # Fallback to regex-based HTML tag removal
-            return re.sub(r'<[^>]+>', ' ', html_content).strip()
-
-
-class GmailAuthenticator:
-    """Handles Gmail API authentication."""
-
-    def __init__(self, credentials_file: str = 'credentials.json', token_file: str = 'token.pickle'):
-        self.credentials_file = credentials_file
-        self.token_file = Path(token_file)
-        self.logger = Logger.setup_logger(self.__class__.__name__)
-
-    def get_credentials(self) -> Credentials:
-        """Get or create Gmail API credentials."""
-        creds = self._load_existing_credentials()
-
-        if not creds or not creds.valid:
-            creds = self._refresh_or_create_credentials(creds)
-            self._save_credentials(creds)
-
-        return creds
-
-    def _load_existing_credentials(self) -> Optional[Credentials]:
-        """Load credentials from token file."""
-        if not self.token_file.exists():
-            return None
-
-        try:
-            with open(self.token_file, 'rb') as token:
-                return pickle.load(token)
+            connection_string = f"mssql+pytds://{self.username}:{self.password}@{self.server}:{self.port}/{self.database}"
+            self.engine = create_engine(connection_string)
+            # Test the connection
+            with self.engine.connect() as conn:
+                pass
+            print("✅ Connected to SQL Server successfully!")
+            return True
         except Exception as e:
-            self.logger.warning(f"Failed to load credentials: {e}")
-            return None
+            print(f"❌ Error connecting to SQL Server: {e}")
+            return False
 
-    def _refresh_or_create_credentials(self, creds: Optional[Credentials]) -> Credentials:
-        """Refresh expired credentials or create new ones."""
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                self.logger.debug("Refreshed expired credentials")
-                return creds
-            except Exception as e:
-                self.logger.error(f"Failed to refresh credentials: {e}")
-
-        return self._create_new_credentials()
-
-    def _create_new_credentials(self) -> Credentials:
-        """Create new credentials via OAuth flow."""
-        if not Path(self.credentials_file).exists():
-            raise AuthenticationError(f"Credentials file '{self.credentials_file}' not found.")
-
+    def execute_query(self, query):
+        """Execute a SQL query and return a DataFrame"""
+        if not self.engine:
+            if not self.connect_to_sql():
+                return None
         try:
-            self.logger.info("Getting new credentials. Browser will open for authorization.")
-            flow = InstalledAppFlow.from_client_secrets_file(self.credentials_file, SCOPES)
-            creds = flow.run_local_server(port=0)
-            self.logger.info("Successfully obtained new credentials")
-            return creds
+            return pd.read_sql(query, self.engine)
         except Exception as e:
-            raise AuthenticationError(f"Failed to get credentials: {e}")
-
-    def _save_credentials(self, creds: Credentials) -> None:
-        """Save credentials to token file."""
-        try:
-            with open(self.token_file, 'wb') as token:
-                pickle.dump(creds, token)
-            self.logger.debug(f"Saved credentials to {self.token_file}")
-        except Exception as e:
-            self.logger.warning(f"Failed to save credentials: {e}")
-
-
-class EmailContentExtractor:
-    """Handles email content extraction."""
-
-    def __init__(self):
-        self.html_processor = HTMLProcessor()
-        self.logger = Logger.setup_logger(self.__class__.__name__)
-
-    def extract_content(self, message_detail: Dict) -> Dict[str, str]:
-        """Extract email content from message detail."""
-        payload = message_detail['payload']
-        mime_type = payload.get('mimeType', '')
-
-        plain_text = ""
-        html_content = ""
-
-        if mime_type == 'text/plain':
-            plain_text = self._decode_email_body(payload)
-        elif mime_type == 'text/html':
-            html_content = self._decode_email_body(payload)
-            plain_text = self.html_processor.html_to_plain_text(html_content)
-        elif 'multipart' in mime_type:
-            plain_text, html_content = self._extract_multipart_content(payload)
-
-        # Convert HTML to plain text if needed
-        if html_content and not plain_text:
-            plain_text = self.html_processor.html_to_plain_text(html_content)
-
-        return {'plain': plain_text, 'html': html_content}
-
-    def _decode_email_body(self, message_part: Dict) -> str:
-        """Decode email body content from a message part."""
-        if message_part.get('body', {}).get('data'):
-            try:
-                data = message_part['body']['data']
-                return base64.urlsafe_b64decode(data).decode('utf-8', errors='replace')
-            except Exception as e:
-                self.logger.warning(f"Error decoding email body: {e}")
-                return ""
-
-        # Handle nested parts
-        if message_part.get('parts'):
-            text_parts = [self._decode_email_body(part) for part in message_part['parts']]
-            return '\n'.join(part for part in text_parts if part)
-
-        return ""
-
-    def _extract_multipart_content(self, payload: Dict) -> tuple[str, str]:
-        """Extract content from multipart messages."""
-        plain_text = ""
-        html_content = ""
-
-        for part in payload.get('parts', []):
-            part_mime = part.get('mimeType', '')
-            if part_mime == 'text/plain':
-                plain_text += self._decode_email_body(part)
-            elif part_mime == 'text/html':
-                html_content += self._decode_email_body(part)
-            elif 'multipart' in part_mime and part.get('parts'):
-                # Handle nested multipart
-                nested_plain, nested_html = self._extract_multipart_content(part)
-                plain_text += nested_plain
-                html_content += nested_html
-
-        return plain_text, html_content
-
-
-class AttachmentProcessor:
-    """Handles email attachment processing."""
-
-    def __init__(self, attachment_dir: Path):
-        self.attachment_dir = attachment_dir
-        self.logger = Logger.setup_logger(self.__class__.__name__)
-
-    def process_attachments(self, service, message_id: str, message_detail: Dict, retrieved_at: str) -> List[EmailAttachment]:
-        """Process and download attachments from an email."""
-        attachments = []
-
-        if 'parts' not in message_detail['payload']:
-            return attachments
-
-        for part in message_detail['payload']['parts']:
-            if 'filename' in part and part['filename']:
-                attachment = self._download_attachment(service, message_id, part, retrieved_at)
-                if attachment:
-                    attachments.append(attachment)
-
-        return attachments
-
-    def _download_attachment(self, service, message_id: str, part: Dict, retrieved_at: str) -> Optional[EmailAttachment]:
-        """Download a single attachment."""
-        filename = part['filename']
-        attachment_id = part['body'].get('attachmentId')
-
-        if not attachment_id:
-            return None
-
-        try:
-            # Get the attachment data
-            attachment = service.users().messages().attachments().get(
-                userId='me', messageId=message_id, id=attachment_id
-            ).execute()
-
-            # Decode and save with timestamp
-            data = base64.urlsafe_b64decode(attachment['data'])
-
-            # Create timestamped filename
-            timestamp = retrieved_at.replace(' ', '_').replace(':', '').replace('-', '')
-            file_extension = Path(filename).suffix
-            file_stem = Path(filename).stem
-            safe_filename = f"sterling_{message_id}_{timestamp}_{file_stem}{file_extension}"
-            file_path = self.attachment_dir / safe_filename
-
-            with open(file_path, 'wb') as f:
-                f.write(data)
-
-            self.logger.info(f"Downloaded attachment: {filename} -> {file_path}")
-
-            return EmailAttachment(
-                original_name=filename,
-                saved_path=str(file_path),
-                size=len(data)
-            )
-        except Exception as e:
-            self.logger.error(f"Failed to process attachment {filename}: {e}")
+            print(f"❌ Error executing query: {e}")
             return None
 
 
-class EmailParser:
-    """Parses email headers and metadata."""
+def read_excel_with_hidden_columns(file_path):
+    """Read Excel file including hidden columns and preserve column visibility info"""
+    # Load the workbook
+    workbook = openpyxl.load_workbook(file_path)
 
-    @staticmethod
-    def extract_headers(message_detail: Dict) -> Dict[str, str]:
-        """Extract relevant headers from email."""
-        headers = message_detail['payload']['headers']
-        header_dict = {h['name'].lower(): h['value'] for h in headers}
+    # Get the active sheet (or you can specify a sheet by name)
+    sheet = workbook.active
 
-        subject = header_dict.get('subject', 'No subject')
-        sender = header_dict.get('from', 'Unknown')
-        date = header_dict.get('date', 'Unknown')
-
-        # Extract sender email
-        sender_email_match = re.search(r'<(.+?)>', sender)
-        sender_email = sender_email_match.group(1) if sender_email_match else sender
-
-        return {
-            'subject': subject,
-            'sender': sender,
-            'sender_email': sender_email,
-            'date': date
+    # Store column visibility information
+    column_visibility = {}
+    for col_letter, col_dimension in sheet.column_dimensions.items():
+        column_visibility[col_letter] = {
+            'hidden': col_dimension.hidden,
+            'width': col_dimension.width
         }
 
+    # Print hidden columns info
+    hidden_cols = [col for col, info in column_visibility.items() if info['hidden']]
+    print(f"Found {len(hidden_cols)} hidden columns: {', '.join(hidden_cols)}")
 
-class SterlingEmailMonitor:
-    """Main class for monitoring Sterling Ornaments emails."""
+    # Read all data including hidden columns
+    all_data = []
+    for row in sheet.iter_rows(values_only=True):
+        all_data.append(row)
 
-    def __init__(self, config: Optional[Dict] = None):
-        self.config = config or {}
-        self.logger = Logger.setup_logger(self.__class__.__name__)
+    # Convert to DataFrame
+    df = pd.DataFrame(all_data)
 
-        # Initialize components
-        self.file_manager = FileManager(self.config.get('base_dir', 'sterling_emails'))
-        self.authenticator = GmailAuthenticator(
-            self.config.get('credentials_file', 'credentials.json'),
-            self.config.get('token_file', 'token.pickle')
-        )
-        self.content_extractor = EmailContentExtractor()
-        self.attachment_processor = AttachmentProcessor(self.file_manager.attachment_dir)
+    # Handle headers (first row)
+    headers = df.iloc[0]
+    df = df[1:]
+    df.columns = headers
 
-        self._gmail_service = None
-        self._setup_signal_handlers()
-
-        self.logger.info(f"Sterling Email Monitor initialized. Base directory: {self.file_manager.base_dir}")
-
-    def _setup_signal_handlers(self) -> None:
-        """Set up signal handlers for graceful shutdown."""
-        def signal_handler(sig, frame):
-            self.logger.info("Received termination signal. Shutting down...")
-            sys.exit(0)
-
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-
-    @property
-    def gmail_service(self):
-        """Get Gmail service with lazy initialization."""
-        if self._gmail_service is None:
-            try:
-                creds = self.authenticator.get_credentials()
-                self._gmail_service = build('gmail', 'v1', credentials=creds)
-                self.logger.info("Successfully authenticated with Gmail API")
-            except Exception as e:
-                raise AuthenticationError(f"Failed to build Gmail service: {e}")
-
-        return self._gmail_service
-
-    def search_sterling_emails(self, most_recent_only: bool = True) -> List[SterlingEmail]:
-        """Search for Sterling emails with attachments."""
-        self.logger.info("Checking for Sterling emails...")
-
-        # More flexible search query to catch variations
-        search_query = "subject:(STERLING outstanding order) has:attachment"
-        max_results = 1 if most_recent_only else 10
-
-        try:
-            results = self.gmail_service.users().messages().list(
-                userId='me', q=search_query, maxResults=max_results
-            ).execute()
-
-            messages = results.get('messages', [])
-
-            if not messages:
-                self.logger.info("No Sterling emails with attachments found.")
-                return []
-
-            # Check if we've already processed the most recent email
-            if most_recent_only and self._is_already_processed(messages[0]['id']):
-                self.logger.info("Most recent email already processed. No new emails to process.")
-                return []
-
-            if most_recent_only:
-                messages = [messages[0]]
-                self.logger.info("Found a new Sterling email with attachments. Processing...")
-            else:
-                self.logger.info(f"Found {len(messages)} Sterling emails with attachments. Processing...")
-
-            return self._process_messages(messages)
-
-        except Exception as e:
-            raise EmailProcessingError(f"Error processing emails: {e}")
-
-    def _is_already_processed(self, message_id: str) -> bool:
-        """Check if a message has already been processed."""
-        last_processed_id = self.file_manager.read_text_file(self.file_manager.last_processed_file)
-        return last_processed_id == message_id
-
-    def _process_messages(self, messages: List[Dict]) -> List[SterlingEmail]:
-        """Process a list of email messages."""
-        sterling_emails = []
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        for message in messages:
-            try:
-                sterling_email = self._process_single_message(message, current_time)
-                if sterling_email:
-                    sterling_emails.append(sterling_email)
-            except Exception as e:
-                self.logger.error(f"Failed to process message {message['id']}: {e}")
-                continue
-
-        if sterling_emails:
-            self._save_results(sterling_emails, len(messages) == 1)
-
-        return sterling_emails
-
-    def _process_single_message(self, message: Dict, current_time: str) -> Optional[SterlingEmail]:
-        """Process a single email message."""
-        msg_id = message['id']
-
-        try:
-            message_detail = self.gmail_service.users().messages().get(userId='me', id=msg_id).execute()
-        except HttpError as e:
-            self.logger.error(f"Failed to fetch email details for ID {msg_id}: {e}")
-            return None
-
-        # Extract headers
-        headers = EmailParser.extract_headers(message_detail)
-
-        self.logger.info(f"Processing email ID: {msg_id}")
-        self.logger.info(f"From: {headers['sender']}")
-        self.logger.info(f"Date: {headers['date']}")
-        self.logger.info(f"Subject: {headers['subject']}")
-
-        # Extract content
-        email_content = self.content_extractor.extract_content(message_detail)
-
-        # Save email content with timestamp
-        email_content_path = self._save_email_content(msg_id, headers, email_content['plain'], current_time)
-
-        # Process attachments with timestamp
-        attachments = self.attachment_processor.process_attachments(
-            self.gmail_service, msg_id, message_detail, current_time
-        )
-
-        if not attachments:
-            self.logger.warning(f"Email with ID: {msg_id} doesn't have valid attachments, skipping.")
-            return None
-
-        # Create preview (first 200 characters)
-        preview = email_content['plain'][:200] + "..." if len(email_content['plain']) > 200 else email_content['plain']
-
-        # Get individual email JSON file path
-        email_json_path = self.file_manager.get_timestamped_email_file(msg_id, current_time)
-
-        sterling_email = SterlingEmail(
-            id=msg_id,
-            subject=headers['subject'],
-            sender=headers['sender'],
-            sender_email=headers['sender_email'],
-            date=headers['date'],
-            retrieved_at=current_time,
-            attachments=attachments,
-            email_content_file=str(email_content_path),
-            email_json_file=str(email_json_path),
-            plain_text_preview=preview
-        )
-
-        # Save individual email JSON
-        self.file_manager.save_json(asdict(sterling_email), email_json_path)
-        self.logger.info(f"Saved individual email JSON to: {email_json_path}")
-
-        return sterling_email
-
-    def _save_email_content(self, msg_id: str, headers: Dict, content: str, current_time: str) -> Path:
-        """Save email content to file with timestamp."""
-        email_path = self.file_manager.get_timestamped_content_file(msg_id, current_time)
-
-        email_content = f"""Subject: {headers['subject']}
-From: {headers['sender']}
-Date: {headers['date']}
-Email ID: {msg_id}
-Retrieved at: {current_time}
-{'-' * 50}
-
-{content}"""
-
-        self.file_manager.write_text_file(email_path, email_content)
-        self.logger.info(f"Saved email content to: {email_path}")
-
-        return email_path
-
-    def _save_results(self, sterling_emails: List[SterlingEmail], is_single: bool) -> None:
-        """Save processing results to files."""
-        try:
-            if is_single:
-                # Save single email details with timestamp
-                email_dict = asdict(sterling_emails[0])
-                latest_file = self.file_manager.latest_email_file
-                self.file_manager.save_json(email_dict, latest_file)
-                self.logger.info(f"Saved latest email details to: {latest_file}")
-            else:
-                # Save all emails summary with timestamp
-                emails_dict = [asdict(email) for email in sterling_emails]
-                summary_file = self.file_manager.get_all_emails_summary_file()
-                self.file_manager.save_json(emails_dict, summary_file)
-                self.logger.info(f"Saved all emails summary to: {summary_file}")
-
-                # Also update legacy summary file
-                self.file_manager.save_json(emails_dict, self.file_manager.summary_file)
-
-            # Update last processed email ID
-            if sterling_emails:
-                self.file_manager.write_text_file(
-                    self.file_manager.last_processed_file,
-                    sterling_emails[0].id
-                )
-
-            # Log attachment summary
-            total_attachments = sum(len(email.attachments) for email in sterling_emails)
-            self.logger.info(f"Found {total_attachments} attachments across {len(sterling_emails)} email(s)")
-
-        except Exception as e:
-            self.logger.error(f"Failed to save results: {e}")
-
-    def get_all_processed_emails_summary(self) -> Dict:
-        """Get summary of all processed emails."""
-        all_emails = self.file_manager.get_all_processed_emails()
-
-        summary = {
-            'total_emails_processed': len(all_emails),
-            'last_updated': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            'emails': all_emails
-        }
-
-        return summary
-
-    def run_scheduled_check(self) -> None:
-        """Run a single scheduled check."""
-        self.logger.info("=" * 50)
-        self.logger.info(f"SCHEDULED CHECK: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        self.logger.info("=" * 50)
-
-        try:
-            sterling_emails = self.search_sterling_emails(most_recent_only=True)
-
-            if sterling_emails:
-                email = sterling_emails[0]
-                self.logger.info("New Sterling email found and processed:")
-                self.logger.info(f"Subject: {email.subject}")
-                self.logger.info(f"From: {email.sender}")
-                self.logger.info(f"Date: {email.date}")
-                self.logger.info(f"Retrieved at: {email.retrieved_at}")
-                self.logger.info(f"Email content saved to: {email.email_content_file}")
-                self.logger.info(f"Email JSON saved to: {email.email_json_file}")
-
-                if email.attachments:
-                    self.logger.info(f"Attachments ({len(email.attachments)}):")
-                    for i, attachment in enumerate(email.attachments, 1):
-                        # Return full absolute path for deployment clarity
-                        full_path = Path(attachment.saved_path).resolve()
-                        self.logger.info(f"{i}. {attachment.original_name}")
-                        self.logger.info(f"   Full path: {full_path}")
-                        if attachment.size:
-                            self.logger.info(f"   Size: {attachment.size:,} bytes")
-                else:
-                    self.logger.info("No attachments found in this email")
-
-                # Display file paths summary
-                self.logger.info("\nFile Paths Summary:")
-                self.logger.info(f"Base directory: {self.file_manager.base_dir}")
-                self.logger.info(f"Attachments directory: {self.file_manager.attachment_dir}")
-                self.logger.info(f"Emails directory: {self.file_manager.emails_dir}")
-                self.logger.info(f"Email content file: {email.email_content_file}")
-                self.logger.info(f"Email JSON file: {email.email_json_file}")
-                self.logger.info(f"Last processed ID file: {self.file_manager.last_processed_file}")
-            else:
-                self.logger.info("No new Sterling emails found during this check.")
-
-            self.logger.info("Waiting for next scheduled check...")
-
-        except Exception as e:
-            self.logger.error(f"Error during scheduled check: {e}")
-
-    def start_monitoring(self, interval_hours: float = 1.0) -> None:
-        """Start monitoring for Sterling Ornaments emails at specified interval."""
-        self.logger.info(f"Starting Sterling Email Monitor to run every {interval_hours} hour(s)")
-        self.logger.info(f"Files will be saved to: {self.file_manager.base_dir.resolve()}")
-
-        # Schedule the job
-        schedule.every(interval_hours).hours.do(self.run_scheduled_check)
-
-        # Run initial check
-        self.logger.info("Running initial check...")
-        self.run_scheduled_check()
-
-        # Keep the script running
-        try:
-            self.logger.info("Monitoring started. Press Ctrl+C to stop.")
-            while True:
-                schedule.run_pending()
-                time.sleep(60)  # Check for pending jobs every minute
-        except KeyboardInterrupt:
-            self.logger.info("Monitoring stopped by user.")
-        except Exception as e:
-            self.logger.critical(f"Unexpected error in monitoring loop: {e}")
-            sys.exit(1)
+    return df, column_visibility, workbook
 
 
-def load_config(config_path: str) -> Dict:
-    """Load configuration from file."""
-    config_file = Path(config_path)
-    if not config_file.exists():
-        return {}
+def copy_excel_with_exact_format(input_file, output_file):
+    """Create an exact copy of the Excel file with all formatting preserved"""
+    # Load the workbook
+    wb = openpyxl.load_workbook(input_file)
+    # Save as new file
+    wb.save(output_file)
+    return wb
 
+def is_default_date(date_str):
+    """Identify a default date (01/01/1900) regardless of format"""
+    if date_str is None or date_str == "":
+        return False
+
+    # Convert to string if it's not already
+    date_str = str(date_str).strip()
+
+    # Try specific string matches first for 1900
+    if date_str == '01/01/1900' or date_str == '1900-01-01' or date_str == '1900/01/01':
+        return True
+
+    # Check if it contains the string pattern for 1900
+    if re.search(r'01.01.1900|1900.01.01', date_str.replace('/', '.').replace('-', '.')):
+        return True
+
+    # Try to parse as a date object and compare
     try:
-        with open(config_file, 'r') as f:
-            return json.load(f)
+        # Try multiple formats
+        for fmt in ['%m/%d/%Y', '%Y-%m-%d', '%m-%d-%Y', '%Y/%m/%d']:
+            try:
+                date_obj = datetime.strptime(date_str, fmt)
+                if date_obj.year == 1900 and date_obj.month == 1 and date_obj.day == 1:
+                    return True
+            except ValueError:
+                continue
     except Exception as e:
-        logging.warning(f"Failed to load configuration file: {e}")
-        return {}
+        print(f"Error parsing date '{date_str}': {e}")
 
+    return False
 
-def main(input_file=None, interval=1.0, config_path='config.json', single_run=True, verbose=False):
-    """
-    Main function for Sterling Ornaments Email Monitor that can be imported.
+def parse_date_string(date_str):
+    """Parse date string and return datetime object or None"""
+    if not date_str or date_str == "":
+        return None
 
-    Args:
-        input_file: Not used in this email monitor (kept for compatibility)
-        interval: Check interval in hours (default: 1.0)
-        config_path: Path to configuration file (default: 'config.json')
-        single_run: Run once and exit (default: True for import usage)
-        verbose: Enable verbose logging (default: False)
+    date_str = str(date_str).strip()
 
-    Returns:
-        dict: Result dictionary with status, message, and output_file
-    """
-    import logging
-    from pathlib import Path
+    # Try multiple date formats
+    formats = ['%m/%d/%Y', '%Y-%m-%d', '%m-%d-%Y', '%Y/%m/%d', '%d/%m/%Y']
 
-    try:
-        # Load configuration
-        config = load_config(config_path)
-
-        # Set up logging level
-        log_level = logging.DEBUG if verbose else logging.INFO
-
-        # Create the monitor
-        monitor = SterlingEmailMonitor(config)
-
-        if single_run:
-            monitor.logger.info("Running email check...")
-            monitor.run_scheduled_check()
-
-            # Check if we got any results
-            latest_email_data = None
-
-            # Try to find the most recent email JSON file
-            if monitor.file_manager.emails_dir.exists():
-                json_files = list(monitor.file_manager.emails_dir.glob('sterling_email_*.json'))
-                if json_files:
-                    # Sort by modification time to get the most recent
-                    latest_json_file = max(json_files, key=lambda x: x.stat().st_mtime)
-                    latest_email_data = monitor.file_manager.load_json(latest_json_file)
-
-            if latest_email_data:
-                # Find XLSX file in attachments
-                xlsx_path = None
-                all_attachments = []
-
-                if latest_email_data.get('attachments'):
-                    for attachment in latest_email_data['attachments']:
-                        full_path = Path(attachment['saved_path']).resolve()
-                        all_attachments.append(str(full_path))
-
-                        # Look for XLSX file
-                        if attachment['original_name'].lower().endswith('.xlsx') and xlsx_path is None:
-                            xlsx_path = str(full_path)
-
-                # Get summary of all processed emails
-                all_emails_summary = monitor.get_all_processed_emails_summary()
-
-                if xlsx_path:
-                    return {
-                        'status': 'success',
-                        'message': f"Successfully processed Sterling email (Retrieved at: {latest_email_data.get('retrieved_at')}). Found XLSX attachment: {Path(xlsx_path).name}",
-                        'output_file': xlsx_path,
-                        'email_data': latest_email_data,
-                        'all_attachments': all_attachments,
-                        'all_emails_summary': all_emails_summary
-                    }
-                elif all_attachments:
-                    return {
-                        'status': 'success',
-                        'message': f"Successfully processed Sterling email (Retrieved at: {latest_email_data.get('retrieved_at')}). Found {len(all_attachments)} attachment(s), but no XLSX file.",
-                        'output_file': all_attachments[0],  # Return first attachment
-                        'email_data': latest_email_data,
-                        'all_attachments': all_attachments,
-                        'all_emails_summary': all_emails_summary
-                    }
-                else:
-                    return {
-                        'status': 'success',
-                        'message': f"Successfully processed Sterling email (Retrieved at: {latest_email_data.get('retrieved_at')}), but no attachments found.",
-                        'output_file': latest_email_data.get('email_content_file'),
-                        'email_data': latest_email_data,
-                        'all_attachments': [],
-                        'all_emails_summary': all_emails_summary
-                    }
-            else:
-                # Get summary even if no new emails
-                all_emails_summary = monitor.get_all_processed_emails_summary()
-                return {
-                    'status': 'success',
-                    'message': "No new Sterling emails found.",
-                    'output_file': None,
-                    'email_data': None,
-                    'all_attachments': [],
-                    'all_emails_summary': all_emails_summary
-                }
-        else:
-            # For continuous monitoring (not typical for import usage)
-            monitor.start_monitoring(interval_hours=interval)
-            return {
-                'status': 'success',
-                'message': "Monitoring started (continuous mode)",
-                'output_file': None,
-                'email_data': None,
-                'all_attachments': [],
-                'all_emails_summary': {}
-            }
-
-    except (ConfigurationError, AuthenticationError, EmailProcessingError) as e:
-        return {
-            'status': 'error',
-            'message': f"Configuration/Authentication Error: {str(e)}",
-            'output_file': None,
-            'email_data': None,
-            'all_attachments': [],
-            'all_emails_summary': {}
-        }
-    except Exception as e:
-        return {
-            'status': 'error',
-            'message': f"Unexpected error: {str(e)}",
-            'output_file': None,
-            'email_data': None,
-            'all_attachments': [],
-            'all_emails_summary': {}
-        }
-
-
-# Example usage
-if __name__ == "__main__":
-    result = main(single_run=True, verbose=True)
-
-    if result['status'] == 'success':
-        print(f"Processing completed: {result['message']}")
-        if result['output_file']:
-            print(f"Output file: {result['output_file']}")
-
-        # Print summary of all emails
-        if result['all_emails_summary']:
-            summary = result['all_emails_summary']
-            print(f"\nAll Emails Summary:")
-            print(f"Total emails processed: {summary['total_emails_processed']}")
-            print(f"Last updated: {summary['last_updated']}")
-
-            if summary['emails']:
-                print("\nRecent emails:")
-                for i, email in enumerate(summary['emails'][:3], 1):  # Show last 3 emails
-                    print(f"{i}. Subject: {email.get('subject', 'N/A')}")
-                    print(f"   Retrieved at: {email.get('retrieved_at', 'N/A')}")
-                    print(f"   Attachments: {len(email.get('attachments', []))}")
-
-        # You can also access:
-        # result['email_data'] - the full latest email data
-        # result['all_attachments'] - list of all attachment paths from latest email
-        # result['all_emails_summary'] - summary of all processed emails
-    else:
-        print(f"Error: {result['message']}")
-
-
-# Additional utility functions for managing emails
-
-def get_all_sterling_emails(base_dir='sterling_emails'):
-    """Utility function to get all processed Sterling emails."""
-    file_manager = FileManager(Path(base_dir))
-    return file_manager.get_all_processed_emails()
-
-
-def cleanup_old_emails(base_dir='sterling_emails', days_to_keep=30):
-    """Utility function to cleanup old email files."""
-    from datetime import datetime, timedelta
-    import os
-
-    file_manager = FileManager(Path(base_dir))
-    cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-
-    deleted_count = 0
-
-    # Clean up old email JSON files
-    if file_manager.emails_dir.exists():
-        for json_file in file_manager.emails_dir.glob('sterling_email_*.json'):
-            if json_file.stat().st_mtime < cutoff_date.timestamp():
-                json_file.unlink()
-                deleted_count += 1
-
-    # Clean up old attachments
-    if file_manager.attachment_dir.exists():
-        for attachment_file in file_manager.attachment_dir.glob('sterling_*'):
-            if attachment_file.stat().st_mtime < cutoff_date.timestamp():
-                attachment_file.unlink()
-                deleted_count += 1
-
-    # Clean up old content files
-    for content_file in file_manager.base_dir.glob('sterling_content_*.txt'):
-        if content_file.stat().st_mtime < cutoff_date.timestamp():
-            content_file.unlink()
-            deleted_count += 1
-
-    return deleted_count
-
-
-def search_emails_by_date_range(base_dir='sterling_emails', start_date=None, end_date=None):
-    """Search for emails within a specific date range."""
-    from datetime import datetime
-
-    all_emails = get_all_sterling_emails(base_dir)
-    filtered_emails = []
-
-    for email in all_emails:
+    for fmt in formats:
         try:
-            retrieved_at = datetime.strptime(email.get('retrieved_at', ''), '%Y-%m-%d %H:%M:%S')
-
-            if start_date and retrieved_at < start_date:
-                continue
-            if end_date and retrieved_at > end_date:
-                continue
-
-            filtered_emails.append(email)
+            return datetime.strptime(date_str, fmt)
         except ValueError:
-            # Skip emails with invalid date format
             continue
 
-    return filtered_emails
+    return None
+
+def format_date_for_comment(date_str):
+    """Format date for comment field as dd/mm/yyyy"""
+    if not date_str or date_str == "":
+        return ""
+
+    date_obj = parse_date_string(date_str)
+    if date_obj:
+        return date_obj.strftime("%d/%m/%Y")
+    return str(date_str)  # Return original string if parsing fails
+
+def format_date_for_inspection(date_str):
+    """Format date for factory inspection plan as dd/mm (day and month only)"""
+    if not date_str or date_str == "":
+        return ""
+
+    date_obj = parse_date_string(date_str)
+    if date_obj:
+        return date_obj.strftime("%d/%m")
+    return str(date_str)  # Return original string if parsing fails
+
+def construct_query(material, po):
+    """Properly construct a SQL query with proper escaping to avoid formatting issues"""
+    # Sanitize inputs
+    material_safe = str(material).replace("'", "''") if material else ""
+    po_safe = str(po).replace("'", "''") if po else ""
+
+    # Manually build the where clause with proper escaping
+    where_parts = []
+
+    if material_safe:
+        where_parts.append(f"scp.cust_ucd = '{material_safe}'")
+
+    if po_safe:
+        po_part = f"((om.cust_po = '{po_safe}' OR om.cust_po LIKE '%%{po_safe}%%') AND om.customer != 'MSE-INTERNAL')"
+
+        numeric_parts = ''.join(c for c in po_safe if c.isdigit())
+        if numeric_parts:
+            po_part = f"({po_part} OR (om.cust_po LIKE '%%{numeric_parts}%%' AND om.customer != 'MSE-INTERNAL'))"
+
+        where_parts.append(po_part)
+
+    # Default condition if no filters provided
+    if not where_parts:
+        where_parts = ["1=1"]
+
+    # Join with AND
+    where_clause = " AND ".join(where_parts)
+
+    # Hardcode the SQL template right here to avoid any issues with format()
+    # UPDATED: Check for 01/01/1900 dates directly in the query
+    # Modified to remove time part by using CONVERT with style 101 (MM/DD/YYYY)
+    query_template = """
+        SELECT
+            RTRIM(ot.article_no) + '/' + CAST(ot.uniq_code AS VARCHAR) AS [Sterling Code/Unique Code],
+            om.fac_order AS [Factory Order No],
+            CONVERT(VARCHAR, om.sched1_dt, 101) AS [Factory Order Date],
+            CASE WHEN CONVERT(VARCHAR, om.lbl_dt, 101) = '01/01/1900' THEN '' 
+                 ELSE CONVERT(VARCHAR, om.lbl_dt, 101) END AS [Label Date],
+            CONVERT(VARCHAR, om.rev_cdate, 101) AS [Customer Date]
+        FROM order_trn ot
+        JOIN sp_cust_price scp 
+            ON ot.article_no = scp.art_code AND ot.uniq_code = scp.uniq_code
+        JOIN order_mast om
+            ON ot.fac_order = om.fac_order
+        WHERE """
+
+    # Directly concatenate the where_clause instead of using format()
+    final_query = query_template + where_clause
+
+    return final_query
+
+def construct_invoice_query(factory_order_no, article_no, unique_no):
+    """Properly construct an invoice query with proper escaping to avoid formatting issues"""
+    if not factory_order_no or str(factory_order_no).strip() == "":
+        return None
+
+    # Sanitize inputs
+    fo_safe = str(factory_order_no).strip().replace("'", "''")
+    article_safe = str(article_no).strip().replace("'", "''") if article_no and str(article_no).strip() != "" else ""
+    unique_safe = str(unique_no).strip().replace("'", "''") if unique_no and str(unique_no).strip() != "" else ""
+
+    # Manually build the where clause
+    where_parts = [f"p.ord = '{fo_safe}'"]
+
+    if article_safe:
+        where_parts.append(f"ot.article_no = '{article_safe}'")
+
+    if unique_safe:
+        where_parts.append(f"ot.uniq_code = '{unique_safe}'")
+
+    # Join with AND
+    where_clause = " AND ".join(where_parts)
+
+    # Hardcode the SQL template here to avoid issues with format()
+    # Modified to convert date without time using CONVERT with style 101 (MM/DD/YYYY)
+    query_template = """
+    SELECT 
+        em.inv_no AS [Invoice Number], 
+        CONVERT(VARCHAR, em.inv_date, 101) AS [Invoice Date],
+        CAST(p.pcs AS VARCHAR) AS [Shipped Quantity]
+    FROM order_mast o 
+    INNER JOIN order_Trn ot ON o.fac_order = ot.fac_order
+    INNER JOIN pkt_trns p ON ot.fac_order = p.ord AND ot.article_no = p.art AND ot.uniq_code = p.uc
+    INNER JOIN export_mast em ON p.inv_no = em.inv_no 
+    WHERE """
+
+    # Directly concatenate the where_clause instead of using format()
+    final_query = query_template + where_clause
+
+    return final_query
+
+def update_comment_and_inspection_columns(output_file):
+    """Update Comment and Factory Inspection Plan columns based on Customer Date"""
+    print("\nUpdating Comment and Factory Inspection Plan columns...")
+
+    # Load the output workbook
+    wb = openpyxl.load_workbook(output_file)
+    ws = wb.active
+
+    # Find header row and column indexes
+    header_row = 1
+    customer_date_col_idx = None
+    comment_col_idx = None
+    inspection_col_idx = None
+
+    # Find column indexes
+    for col_idx, cell in enumerate(ws[header_row], start=1):
+        cell_value = str(cell.value).strip() if cell.value else ""
+        if cell_value == 'Customer Date':
+            customer_date_col_idx = col_idx
+        elif cell_value == 'Comment':
+            comment_col_idx = col_idx
+        elif cell_value == 'Factory Inspection Plan':
+            inspection_col_idx = col_idx
+
+    # Check if Customer Date column exists
+    if customer_date_col_idx is None:
+        print("⚠️ Customer Date column not found - cannot update Comment and Factory Inspection Plan")
+        wb.close()
+        return
+
+    # Add Comment column if it doesn't exist
+    if comment_col_idx is None:
+        max_col = ws.max_column
+        comment_col_idx = max_col + 1
+        ws.cell(row=header_row, column=comment_col_idx).value = 'Comment'
+        print(f"Added 'Comment' column at position {comment_col_idx}")
+
+    # Add Factory Inspection Plan column if it doesn't exist
+    if inspection_col_idx is None:
+        max_col = ws.max_column
+        inspection_col_idx = max_col + 1
+        ws.cell(row=header_row, column=inspection_col_idx).value = 'Factory Inspection Plan'
+        print(f"Added 'Factory Inspection Plan' column at position {inspection_col_idx}")
+
+    # Process each row
+    comment_updates = 0
+    inspection_updates = 0
+
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        # Get Customer Date value
+        customer_date_value = ws.cell(row=row_idx, column=customer_date_col_idx).value
+
+        if customer_date_value and str(customer_date_value).strip() != "":
+            customer_date_str = str(customer_date_value).strip()
+
+            # Update Comment column if empty
+            comment_cell = ws.cell(row=row_idx, column=comment_col_idx)
+            if not comment_cell.value or str(comment_cell.value).strip() == "":
+                formatted_date = format_date_for_comment(customer_date_str)
+                if formatted_date:
+                    comment_text = f"This item is schedule to be ready by {formatted_date}"
+                    comment_cell.value = comment_text
+                    comment_updates += 1
+
+            # Update Factory Inspection Plan column if empty
+            inspection_cell = ws.cell(row=row_idx, column=inspection_col_idx)
+            if not inspection_cell.value or str(inspection_cell.value).strip() == "":
+                formatted_inspection_date = format_date_for_inspection(customer_date_str)
+                if formatted_inspection_date:
+                    inspection_cell.value = formatted_inspection_date
+                    inspection_updates += 1
+
+    # Save the workbook
+    wb.save(output_file)
+    wb.close()
+
+    print(f"✅ Updated {comment_updates} Comment fields")
+    print(f"✅ Updated {inspection_updates} Factory Inspection Plan fields")
+
+def update_excel_with_query_results(output_file, material_column, po_column, query_results):
+    """Update the Excel file with SQL query results while preserving format"""
+    # Load the output workbook
+    wb = openpyxl.load_workbook(output_file)
+    ws = wb.active
+
+    # Find header row and column indexes
+    header_row = 1  # Assuming first row contains headers
+    material_col_idx = None
+    po_col_idx = None
+
+    # Get column indexes from headers
+    for col_idx, cell in enumerate(ws[header_row], start=1):
+        if cell.value == material_column:
+            material_col_idx = col_idx
+        elif cell.value == po_column:
+            po_col_idx = col_idx
+
+    if material_col_idx is None or po_col_idx is None:
+        print(f"⚠️ Could not find Material or PO column in the Excel file")
+        print(f"Looking for '{material_column}' and '{po_column}'")
+        print(f"Available headers: {[cell.value for cell in ws[header_row]]}")
+        return [], None
+
+    # Add new columns for SQL results if they don't exist
+    new_columns = ['Sterling Code/Unique Code', 'Factory Order No', 'Factory Order Date',
+                   'Label Date', 'Customer Date']
+
+    # Find the last column index
+    max_col = ws.max_column
+    col_mappings = {}
+
+    # Check if columns already exist, otherwise add them
+    for col_name in new_columns:
+        col_exists = False
+        for col_idx in range(1, max_col + 1):
+            if ws.cell(row=header_row, column=col_idx).value == col_name:
+                col_exists = True
+                col_mappings[col_name] = col_idx
+                break
+
+        if not col_exists:
+            max_col += 1
+            ws.cell(row=header_row, column=max_col).value = col_name
+            col_mappings[col_name] = max_col
+            print(f"Added new column '{col_name}' at position {max_col}")
+
+    # Iterate through data rows and update with query results
+    rows_updated = 0
+    total_rows = 0
+    rows_with_data = 0
+    factory_order_data = []  # Store factory orders with article numbers and unique codes
+    factory_order_col_idx = col_mappings.get('Factory Order No', None)
+    sterling_code_col_idx = col_mappings.get('Sterling Code/Unique Code', None)
+    label_date_col_idx = col_mappings.get('Label Date', None)
+
+    for row_idx in range(header_row + 1, ws.max_row + 1):
+        total_rows += 1
+        # Get Material and PO values from the row
+        material_value = ws.cell(row=row_idx, column=material_col_idx).value
+        po_value = ws.cell(row=row_idx, column=po_col_idx).value
+
+        # Skip completely empty rows
+        if material_value is None and po_value is None:
+            continue
+
+        rows_with_data += 1
+
+        # Standardize material and PO values exactly like when building the result_map
+        material_str = str(material_value).strip() if material_value is not None else ""
+
+        # Handle PO values preserving their original format
+        if pd.isna(po_value) or po_value is None:
+            po_str = ""
+        else:
+            po_str = str(po_value).strip()
+
+        # Debug print some rows to see what's happening
+        if rows_with_data <= 5 or rows_with_data % 100 == 0:
+            print(f"Row {row_idx}: Material='{material_str}', PO='{po_str}'")
+
+        # Check if we have results for this Material/PO combination
+        key = (material_str, po_str)
+
+        if key in query_results and not query_results[key].empty:
+            # Get the first row of results for this key
+            result_data = query_results[key].iloc[0].to_dict()
+
+            # Handle Label Date - replace 01/01/1900 with empty string
+            if 'Label Date' in result_data and is_default_date(result_data['Label Date']):
+                result_data['Label Date'] = ''
+
+            # Update cells with result data
+            for col_name, col_idx in col_mappings.items():
+                if col_name in result_data:
+                    # Double-check Label Date again right before writing to Excel
+                    if col_name == 'Label Date' and is_default_date(result_data[col_name]):
+                        ws.cell(row=row_idx, column=col_idx).value = ''
+                    else:
+                        ws.cell(row=row_idx, column=col_idx).value = result_data[col_name]
+
+            # If this is the Factory Order No column and Sterling Code column, store their values
+            factory_order_value = result_data.get('Factory Order No')
+            sterling_code = result_data.get('Sterling Code/Unique Code')
+
+            # We need article_no and unique_no for invoice query, so extract them from Sterling Code
+            if sterling_code and '/' in sterling_code:
+                article_no = sterling_code.split('/')[0]
+                unique_no = sterling_code.split('/')[1]
+            else:
+                article_no = ""
+                unique_no = ""
+
+            if factory_order_value is not None:
+                factory_order_data.append((row_idx, factory_order_value, article_no, unique_no))
+
+            rows_updated += 1
+
+    # ADDITIONAL LABEL DATE SCAN: Check the entire sheet for any missed instances
+    if label_date_col_idx:
+        print("\nPerforming additional Label Date check across entire worksheet...")
+        fixed_count = 0
+
+        for row_idx in range(header_row + 1, ws.max_row + 1):
+            label_date_value = ws.cell(row=row_idx, column=label_date_col_idx).value
+
+            # Handle any variant of the 01/01/1900 date
+            if label_date_value is not None and is_default_date(label_date_value):
+                ws.cell(row=row_idx, column=label_date_col_idx).value = ''
+                fixed_count += 1
+
+        if fixed_count > 0:
+            print(f"Fixed an additional {fixed_count} rows with default date (01/01/1900) values")
+
+    # Save the updated workbook
+    wb.save(output_file)
+    wb.close()  # Explicitly close the workbook
+
+    print(f"Processed {total_rows} total rows, {rows_with_data} rows with data")
+    print(f"Updated {rows_updated} rows in {output_file}")
+
+    return factory_order_data, factory_order_col_idx
+
+def update_excel_with_invoice_data(output_file, factory_order_data, factory_order_col_idx, invoice_results):
+    """Update the Excel file with invoice query results"""
+    # Load the output workbook
+    wb = openpyxl.load_workbook(output_file)
+    ws = wb.active
+
+    # Find header row
+    header_row = 1
+
+    # Add new columns for invoice data if they don't exist
+    invoice_columns = ['Invoice Number', 'Invoice Date', 'Shipped Quantity']
+
+    # Find the last column index
+    max_col = ws.max_column
+    inv_col_mappings = {}
+
+    # FIRST ENSURE ALL COLUMNS EXIST IN THE EXCEL FILE
+    for col_name in invoice_columns:
+        col_exists = False
+        for col_idx in range(1, max_col + 1):
+            if ws.cell(row=header_row, column=col_idx).value == col_name:
+                col_exists = True
+                inv_col_mappings[col_name] = col_idx
+                print(f"Found existing column '{col_name}' at position {col_idx}")
+                break
+
+        if not col_exists:
+            max_col += 1
+            ws.cell(row=header_row, column=max_col).value = col_name
+            inv_col_mappings[col_name] = max_col
+            print(f"Added new column '{col_name}' at position {max_col}")
+
+    # Double verify that the Shipped Qty column exists
+    if 'Shipped Quantity' not in inv_col_mappings:
+        print(f"⚠️ CRITICAL: 'Shipped Quantity' column was not added properly!")
+        # Force add it again
+        max_col += 1
+        ws.cell(row=header_row, column=max_col).value = 'Shipped Quantity'
+        inv_col_mappings['Shipped Quantity'] = max_col
+        print(f"🔄 Forcibly added 'Shipped Quantity' column at position {max_col}")
+
+    # Track number of rows updated with invoice data
+    invoice_rows_updated = 0
+
+    # VERIFY AND FIX LABEL DATE VALUES ACROSS THE ENTIRE SHEET
+    # Check for Label Date column
+    label_date_col_idx = None
+    for col_idx in range(1, ws.max_column + 1):
+        if ws.cell(row=header_row, column=col_idx).value == 'Label Date':
+            label_date_col_idx = col_idx
+            break
+
+    # Fix any Label Date values that are still showing as 01/01/1900
+    if label_date_col_idx:
+        print("Scanning entire sheet for any Label Date = 01/01/1900 values...")
+        fixed_count = 0
+        for row_idx in range(header_row + 1, ws.max_row + 1):
+            label_date_value = ws.cell(row=row_idx, column=label_date_col_idx).value
+            # Check for the exact string '01/01/1900'
+            if label_date_value == '01/01/1900':
+                ws.cell(row=row_idx, column=label_date_col_idx).value = ''
+                fixed_count += 1
+            # Also use the function for more complex cases
+            elif label_date_value and is_default_date(label_date_value):
+                ws.cell(row=row_idx, column=label_date_col_idx).value = ''
+                fixed_count += 1
+
+        if fixed_count > 0:
+            print(f"Fixed {fixed_count} rows with default Label Date values")
+
+    # Iterate through factory order numbers and update with invoice data
+    for row_idx, factory_order_no, article_no, unique_no in factory_order_data:
+        # Skip if factory order number is None or empty
+        if factory_order_no is None or str(factory_order_no).strip() == "":
+            continue
+
+        # Normalize factory order number
+        fo_str = str(factory_order_no).strip()
+
+        # Check if we have invoice results for this factory order number
+        if fo_str in invoice_results and not invoice_results[fo_str].empty:
+            # We might have multiple invoices per factory order - get the first one for now
+            invoice_data = invoice_results[fo_str].iloc[0].to_dict()
+
+            # Update cells with invoice data
+            for col_name, col_idx in inv_col_mappings.items():
+                if col_name in invoice_data:
+                    # For Shipped Qty specifically, ensure it's a string and force writing
+                    if col_name == 'Shipped Quantity':
+                        value = str(invoice_data[col_name]) if invoice_data[col_name] is not None else ""
+                        ws.cell(row=row_idx, column=col_idx).value = value
+                    else:
+                        value = invoice_data[col_name]
+                        ws.cell(row=row_idx, column=col_idx).value = value
+
+            invoice_rows_updated += 1
+
+    # Make sure all columns are really there by adding them again if needed
+    for col_name in invoice_columns:
+        found = False
+        for col_idx in range(1, ws.max_column + 1):
+            if ws.cell(row=header_row, column=col_idx).value == col_name:
+                found = True
+                break
+
+        if not found:
+            print(f"⚠️ WARNING: Column '{col_name}' is still missing! Adding it one more time.")
+            ws.cell(row=header_row, column=ws.max_column + 1).value = col_name
+
+    # Save the updated workbook
+    wb.save(output_file)
+    wb.close()  # Explicitly close the workbook
+    print(f"Updated {invoice_rows_updated} rows with invoice data in {output_file}")
+
+    # Return success status based on whether Shipped Qty column was added
+    return 'Shipped Quantity' in inv_col_mappings
+
+def get_recent_files(folder_path, file_pattern="*.xlsx", max_files=5):
+    """
+    Get the most recently added/modified files in the specified folder
+
+    Args:
+        folder_path: Path to the folder to search
+        file_pattern: Pattern to match files (e.g., "*.xlsx")
+        max_files: Maximum number of files to return
+
+    Returns:
+        List of file paths sorted by modification time (newest first)
+    """
+    # Make sure folder path exists
+    if not os.path.exists(folder_path):
+        print(f"⚠️ Folder does not exist: {folder_path}")
+        return []
+
+    # Get all files matching the pattern
+    files = glob.glob(os.path.join(folder_path, file_pattern))
+
+    if not files:
+        print(f"⚠️ No {file_pattern} files found in {folder_path}")
+        return []
+
+    # Sort files by modification time (newest first)
+    files_with_time = [(f, os.path.getmtime(f)) for f in files]
+    sorted_files = sorted(files_with_time, key=lambda x: x[1], reverse=True)
+
+    # Return the paths of the most recent files
+    recent_files = [f[0] for f in sorted_files[:max_files]]
+
+    print(f"✅ Found {len(recent_files)} recent {file_pattern} files in {folder_path}")
+    for i, file in enumerate(recent_files):
+        print(f"  {i+1}. {os.path.basename(file)} - Modified: {time.ctime(os.path.getmtime(file))}")
+
+    return recent_files
+
+def generate_output_filename(input_file):
+    """
+    Generate an output filename by adding *Auto*_Generated to the filename
+
+    Args:
+        input_file: Original filename
+
+    Returns:
+        New filename with *Auto*_Generated added
+    """
+    # Split the path, filename, and extension
+    dir_path = os.path.dirname(input_file)
+    base_name = os.path.basename(input_file)
+    name, ext = os.path.splitext(base_name)
+
+    # Create new filename with *Auto*_Generated
+    new_name = f"{name}_*Auto*_Generated{ext}"
+
+    # If directory path exists, join it with the new filename
+    if dir_path:
+        new_path = os.path.join(dir_path, new_name)
+    else:
+        new_path = new_name
+
+    return new_path
+
+
+# Main execution function
+def process_file(input_file, output_file=None):
+    """
+    Process a single file with the SQL queries and updates
+
+    Args:
+        input_file: Path to the input Excel file
+        output_file: Path to the output Excel file (if None, will be generated)
+
+    Returns:
+        Path to the output file
+    """
+    # Start timer
+    start_time = time.time()
+
+    # Generate output filename if not provided
+    if output_file is None:
+        output_file = generate_output_filename(input_file)
+
+    print(f"\n{'='*80}")
+    print(f"PROCESSING FILE: {input_file}")
+    print(f"OUTPUT FILE: {output_file}")
+    print(f"{'='*80}\n")
+
+    # --- Configuration ---
+    server = "111.93.56.76"
+    database = "SOPL"
+    username = "Krutika"
+    password = "K123456"
+
+    # Show all columns in the output
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_colwidth', None)
+
+    # --- Instantiate SQL runner ---
+    runner = SQLQueryRunner(server, database, username, password)
+
+    # --- Read Excel file including hidden columns ---
+    print(f"Reading Excel file: {input_file}")
+    excel_data, column_visibility, original_workbook = read_excel_with_hidden_columns(input_file)
+
+    # Find material (column H) and PO (column D)
+    material_column = 'Material'  # Adjust if your actual column name is different
+    po_column = 'PO'  # Adjust if your actual column name is different
+
+    # Check if columns exist by name
+    if material_column not in excel_data.columns:
+        # Try by index (column H is typically index 7)
+        material_column = excel_data.columns[7]
+        print(f"Using column {material_column} for Material")
+
+    if po_column not in excel_data.columns:
+        # Try by index (column D is typically index 3)
+        po_column = excel_data.columns[3]
+        print(f"Using column {po_column} for PO")
+
+    # Process all rows even with some null values (as long as we have either Material or PO)
+    material_po_pairs = excel_data[[material_column, po_column]].copy()
+    material_po_pairs = material_po_pairs[~(material_po_pairs[material_column].isna() & material_po_pairs[po_column].isna())]
+    material_po_pairs = material_po_pairs.drop_duplicates()
+
+    print(f"Found {len(material_po_pairs)} Material/PO combinations to process")
+
+    # Create an exact copy of the input file as our output file
+    print(f"Creating output file: {output_file}")
+    copy_excel_with_exact_format(input_file, output_file)
+
+    # ---- PHASE 1: Get Factory Order details ----
+    print("PHASE 1: Executing SQL queries for Factory Orders...")
+    query_results = {}
+    total_results_rows = 0
+
+    # Process in batches
+    for idx, row in material_po_pairs.iterrows():
+        # Get material and PO values
+        material = str(row[material_column]).strip() if not pd.isna(row[material_column]) else ""
+
+        # Handle PO values without trying to convert to integer
+        po = str(row[po_column]).strip() if not pd.isna(row[po_column]) else ""
+
+        # Skip if both are empty
+        if not material and not po:
+            continue
+
+        # Print info about the query
+        print(f"Querying Material: '{material}', PO: '{po}'")
+
+        # Execute the query
+        query = construct_query(material, po)
+        result = runner.execute_query(query)
+
+        key = (material, po)
+        if result is not None and not result.empty:
+            query_results[key] = result
+            total_results_rows += len(result)
+            print(f"  ✓ Found {len(result)} results")
+        else:
+            query_results[key] = pd.DataFrame()  # Empty DataFrame for no results
+            print("  × No results found")
+
+    print(f"\nRetrieved {total_results_rows} total rows from SQL queries")
+    print(f"Found data for {len([k for k, v in query_results.items() if not v.empty])}/{len(query_results)} Material/PO combinations")
+
+    # Now update the Excel file with all the query results
+    print("\nUpdating Excel file with Factory Order results...")
+    factory_order_data, factory_order_col_idx = update_excel_with_query_results(output_file, material_column, po_column, query_results)
+
+    # Add a small delay to ensure file is completely saved
+    time.sleep(2)
+
+    # ---- PHASE 2: Get Invoice details ----
+    print(f"\nPHASE 2: Executing SQL queries for Invoice Data...")
+    print(f"Found {len(factory_order_data)} Factory Order numbers to query for invoices")
+
+    # Execute invoice queries and store results
+    invoice_results = {}
+
+    for i, (row_idx, factory_order_no, article_no, unique_no) in enumerate(factory_order_data):
+        # Skip if factory order number is None or empty
+        if factory_order_no is None or str(factory_order_no).strip() == "":
+            continue
+
+        # Convert to string and standardize format
+        fo_str = str(factory_order_no).strip()
+
+        # Only display progress for some orders to avoid cluttering the output
+        if i < 5 or i % 50 == 0:
+            print(f"Querying Invoice data for Factory Order: '{fo_str}', Article No: '{article_no}', Unique Code: '{unique_no}' (Order {i+1}/{len(factory_order_data)})")
+
+        # Execute the invoice query with article_no and unique_no
+        query = construct_invoice_query(fo_str, article_no, unique_no)
+        if query:
+            result = runner.execute_query(query)
+
+            if result is not None and not result.empty:
+                invoice_results[fo_str] = result
+                if i < 5 or i % 50 == 0:
+                    print(f"  ✓ Found {len(result)} invoices")
+            else:
+                invoice_results[fo_str] = pd.DataFrame()  # Empty DataFrame for no results
+                if i < 5 or i % 50 == 0:
+                    print("  × No invoices found")
+
+    print(f"\nRetrieved invoice data for {len([k for k, v in invoice_results.items() if not v.empty])}/{len(factory_order_data)} Factory Orders")
+
+    # Update Excel file with invoice data
+    print("\nUpdating Excel file with Invoice results...")
+    shipped_qty_added = update_excel_with_invoice_data(output_file, factory_order_data, factory_order_col_idx, invoice_results)
+
+    # ---- PHASE 3: Update Comment and Factory Inspection Plan columns ----
+    print(f"\nPHASE 3: Updating Comment and Factory Inspection Plan columns...")
+    update_comment_and_inspection_columns(output_file)
+
+    # Calculate processing time
+    end_time = time.time()
+    duration = end_time - start_time
+
+    print(f"\n{'='*80}")
+    print(f"✅ PROCESSING COMPLETED SUCCESSFULLY!")
+    print(f"📁 Output file: {output_file}")
+    print(f"⏱️ Total processing time: {duration:.2f} seconds")
+    print(f"{'='*80}")
+
+    return output_file
+
+# Alternative: Modify the existing main function to have a simple_return parameter
+def main_with_option(input_file, output_file=None, server="111.93.56.76", database="SOPL",
+                    username="Krutika", password="K123456", simple_return=False):
+    """
+    Main function with option to return just the file path or full details
+
+    Args:
+        input_file: Path to the input Excel file
+        output_file: Path to the output Excel file (if None, will be generated)
+        server: SQL Server address
+        database: Database name
+        username: Database username
+        password: Database password
+        simple_return: If True, returns only output file path; if False, returns full dict
+
+    Returns:
+        str or dict: Output file path (if simple_return=True) or full results dict
+    """
+    try:
+        # Start timer
+        start_time = time.time()
+
+        # Generate output filename if not provided
+        if output_file is None:
+            output_file = generate_output_filename(input_file)
+
+        print(f"\n{'='*80}")
+        print(f"PROCESSING FILE: {input_file}")
+        print(f"OUTPUT FILE: {output_file}")
+        print(f"{'='*80}\n")
+
+        # Show all columns in the output
+        pd.set_option('display.max_columns', None)
+        pd.set_option('display.width', None)
+        pd.set_option('display.max_colwidth', None)
+
+        # --- Instantiate SQL runner ---
+        runner = SQLQueryRunner(server, database, username, password)
+
+        # --- Read Excel file including hidden columns ---
+        print(f"Reading Excel file: {input_file}")
+        excel_data, column_visibility, original_workbook = read_excel_with_hidden_columns(input_file)
+
+        # Find material (column H) and PO (column D)
+        material_column = 'Material'
+        po_column = 'PO'
+
+        # Check if columns exist by name
+        if material_column not in excel_data.columns:
+            # Try by index (column H is typically index 7)
+            material_column = excel_data.columns[7]
+            print(f"Using column {material_column} for Material")
+
+        if po_column not in excel_data.columns:
+            # Try by index (column D is typically index 3)
+            po_column = excel_data.columns[3]
+            print(f"Using column {po_column} for PO")
+
+        # Process all rows even with some null values
+        material_po_pairs = excel_data[[material_column, po_column]].copy()
+        material_po_pairs = material_po_pairs[~(material_po_pairs[material_column].isna() & material_po_pairs[po_column].isna())]
+        material_po_pairs = material_po_pairs.drop_duplicates()
+
+        print(f"Found {len(material_po_pairs)} Material/PO combinations to process")
+
+        # Create an exact copy of the input file as our output file
+        print(f"Creating output file: {output_file}")
+        copy_excel_with_exact_format(input_file, output_file)
+
+        # ---- PHASE 1: Get Factory Order details ----
+        print("PHASE 1: Executing SQL queries for Factory Orders...")
+        query_results = {}
+        total_results_rows = 0
+
+        # Process in batches
+        for idx, row in material_po_pairs.iterrows():
+            # Get material and PO values
+            material = str(row[material_column]).strip() if not pd.isna(row[material_column]) else ""
+            po = str(row[po_column]).strip() if not pd.isna(row[po_column]) else ""
+
+            # Skip if both are empty
+            if not material and not po:
+                continue
+
+            print(f"Querying Material: '{material}', PO: '{po}'")
+
+            # Execute the query
+            query = construct_query(material, po)
+            result = runner.execute_query(query)
+
+            key = (material, po)
+            if result is not None and not result.empty:
+                query_results[key] = result
+                total_results_rows += len(result)
+                print(f"  ✓ Found {len(result)} results")
+            else:
+                query_results[key] = pd.DataFrame()
+                print("  × No results found")
+
+        print(f"\nRetrieved {total_results_rows} total rows from SQL queries")
+        print(f"Found data for {len([k for k, v in query_results.items() if not v.empty])}/{len(query_results)} Material/PO combinations")
+
+        # Update the Excel file with all the query results
+        print("\nUpdating Excel file with Factory Order results...")
+        factory_order_data, factory_order_col_idx = update_excel_with_query_results(output_file, material_column, po_column, query_results)
+
+        # Add a small delay to ensure file is completely saved
+        time.sleep(2)
+
+        # ---- PHASE 2: Get Invoice details ----
+        print(f"\nPHASE 2: Executing SQL queries for Invoice Data...")
+        print(f"Found {len(factory_order_data)} Factory Order numbers to query for invoices")
+
+        # Execute invoice queries and store results
+        invoice_results = {}
+
+        for i, (row_idx, factory_order_no, article_no, unique_no) in enumerate(factory_order_data):
+            # Skip if factory order number is None or empty
+            if factory_order_no is None or str(factory_order_no).strip() == "":
+                continue
+
+            # Convert to string and standardize format
+            fo_str = str(factory_order_no).strip()
+
+            # Only display progress for some orders to avoid cluttering the output
+            if i < 5 or i % 50 == 0:
+                print(f"Querying Invoice data for Factory Order: '{fo_str}', Article No: '{article_no}', Unique Code: '{unique_no}' (Order {i+1}/{len(factory_order_data)})")
+
+            # Execute the invoice query with article_no and unique_no
+            query = construct_invoice_query(fo_str, article_no, unique_no)
+            if query:
+                result = runner.execute_query(query)
+
+                if result is not None and not result.empty:
+                    invoice_results[fo_str] = result
+                    if i < 5 or i % 50 == 0:
+                        print(f"  ✓ Found {len(result)} invoices")
+                else:
+                    invoice_results[fo_str] = pd.DataFrame()
+                    if i < 5 or i % 50 == 0:
+                        print("  × No invoices found")
+
+        print(f"\nRetrieved invoice data for {len([k for k, v in invoice_results.items() if not v.empty])}/{len(factory_order_data)} Factory Orders")
+
+        # Update Excel file with invoice data
+        print("\nUpdating Excel file with Invoice results...")
+        shipped_qty_added = update_excel_with_invoice_data(output_file, factory_order_data, factory_order_col_idx, invoice_results)
+
+        # ---- PHASE 3: Update Comment and Factory Inspection Plan columns ----
+        print(f"\nPHASE 3: Updating Comment and Factory Inspection Plan columns...")
+        update_comment_and_inspection_columns(output_file)
+
+        # Calculate processing time
+        end_time = time.time()
+        duration = end_time - start_time
+
+        # Create full results dictionary
+        result_dict = {
+            'status': 'success',
+            'input_file': input_file,
+            'output_file': output_file,
+            'processing_time': duration,
+            'total_material_po_combinations': len(material_po_pairs),
+            'factory_orders_found': len(factory_order_data),
+            'invoice_records_found': len([k for k, v in invoice_results.items() if not v.empty]),
+            'shipped_qty_column_added': shipped_qty_added,
+            'comment_inspection_updated': True,
+            'message': f'Successfully processed {input_file} in {duration:.2f} seconds'
+        }
+
+        print(f"\n{'='*80}")
+        print(f"✅ PROCESSING COMPLETED SUCCESSFULLY!")
+        print(f"📁 Output file: {output_file}")
+        print(f"⏱️ Total processing time: {duration:.2f} seconds")
+        print(f"{'='*80}")
+
+        # Return based on simple_return parameter
+        if simple_return:
+            return output_file
+        else:
+            return result_dict
+
+    except Exception as e:
+        error_result = {
+            'status': 'error',
+            'input_file': input_file,
+            'output_file': output_file if 'output_file' in locals() else None,
+            'error': str(e),
+            'message': f'Error processing {input_file}: {str(e)}'
+        }
+
+        if simple_return:
+            return None
+        else:
+            return error_result
 
